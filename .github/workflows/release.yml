@@ -1,0 +1,109 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g. 1.0.0)'
+        required: true
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve version and tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ inputs.version }}"
+            TAG="v${VERSION}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+            VERSION="${TAG#v}"
+          fi
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+          echo "TAG=${TAG}" >> "$GITHUB_ENV"
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Build
+        shell: bash
+        run: |
+          dotnet restore CSSProfiler.csproj
+          # CopyLocalLockFileAssemblies forces the NuGet dependency DLLs into bin/
+          # (CS# loads each plugin in its own context, so every dep must ship beside it).
+          dotnet build CSSProfiler.csproj -c Release --no-restore \
+            -p:Version="${VERSION}" \
+            -p:CopyLocalLockFileAssemblies=true
+
+      - name: Stage payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="bin/Release/net10.0"
+          STAGE="stage/addons/counterstrikesharp/plugins/CSSProfiler"
+          mkdir -p "$STAGE"
+
+          # Assemblies provided by the CS# host / .NET shared framework. The runtime
+          # already loads these; shipping a second copy risks a duplicate-load conflict,
+          # so they must never enter the payload. CounterStrikeSharp.API is already kept
+          # out of bin/ by ExcludeAssets=runtime in the csproj; this is the safety net.
+          RUNTIME_PREFIXES=(CounterStrikeSharp Microsoft.Extensions. Microsoft.Bcl. Microsoft.Win32. System. netstandard Mono.)
+
+          # The plugin's own outputs.
+          for ext in dll pdb deps.json; do
+            [ -f "$BIN/CSSProfiler.$ext" ] && cp "$BIN/CSSProfiler.$ext" "$STAGE/"
+          done
+
+          # Bundled dependency DLLs (Microsoft.Diagnostics.*, Dia2Lib, TraceReloggerLib, ...),
+          # minus anything the runtime already provides.
+          for dll in "$BIN"/*.dll; do
+            name="$(basename "$dll")"
+            [ "$name" = "CSSProfiler.dll" ] && continue
+            skip=false
+            for p in "${RUNTIME_PREFIXES[@]}"; do
+              case "$name" in "$p"*) skip=true; break;; esac
+            done
+            $skip && continue
+            cp "$dll" "$STAGE/"
+          done
+
+          echo "Staged payload:"
+          ls -1 "$STAGE"
+
+      - name: Zip
+        shell: bash
+        run: |
+          set -euo pipefail
+          ( cd stage && zip -r "../CSSProfiler-${TAG}.zip" addons )
+          echo "Zip contents:"
+          unzip -l "CSSProfiler-${TAG}.zip"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CSSProfiler-${{ env.TAG }}
+          path: CSSProfiler-*.zip
+
+      - name: Create GitHub Release
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: CSS-Profiler ${{ env.TAG }}
+          files: CSSProfiler-*.zip
+          draft: false
+          prerelease: false
